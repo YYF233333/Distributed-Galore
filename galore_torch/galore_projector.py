@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-import fbpca
 import time
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
@@ -81,6 +80,8 @@ class GaLoreProjector:
     # svd decomposition
     def get_orthogonal_matrix(self, weights, rank, type):
         module_params = weights
+        ret_val = None
+        original_device, original_type = None, None
 
         if module_params.data.dtype != torch.float:
             float_data = False
@@ -96,43 +97,22 @@ class GaLoreProjector:
         global thread_pool
         if self.ortho_matrix is None:
             # first time, GPU SVD
-            U, s, Vh = torch.linalg.svd(matrix, full_matrices = False)
-            self.last_result = (U, s, Vh)
+            self.last_result = self.get_orthogonal_matrix_cpu(matrix, rank, type, float_data, original_device, original_type)
+            ret_val = self.last_result
         else:
             if isinstance(self.last_result, Future):
                 self.last_result = self.last_result.result()
                 print("Fetch last result")
-            U, s, Vh = self.last_result
-            U, s, Vh = U.cuda(), s.cuda(), Vh.cuda()
-            self.last_result = thread_pool.submit(self.get_orthogonal_matrix_cpu, matrix.cpu(), rank)
+            if type == 'full':
+                ret_val = [m.cuda() for m in self.last_result]
+            else:
+                ret_val = self.last_result.cuda()
+            self.last_result = thread_pool.submit(self.get_orthogonal_matrix_cpu, matrix.cpu(), rank, type, float_data, original_device, original_type)
         #print(f"SVD decomposition done. Time taken: {time.time() - start:.2f} s")
-        
-        #make the smaller matrix always to be orthogonal matrix
-        if type=='right':
-            A = U[:, :rank] @ torch.diag(s[:rank])
-            B = Vh[:rank, :]
-            
-            if not float_data:
-                B = B.to(original_device).type(original_type)
-            return B.type(torch.float)
-        elif type=='left':
-            A = U[:, :rank]
-            B = torch.diag(s[:rank]) @ Vh[:rank, :]
-            if not float_data:
-                A = A.to(original_device).type(original_type)
-            return A.type(torch.float)
-        elif type=='full':
-            A = U[:, :rank]
-            B = Vh[:rank, :]
-            if not float_data:
-                A = A.to(original_device).type(original_type)
-                B = B.to(original_device).type(original_type)
-            return [A.type(torch.float), B.type(torch.float)]
-        else:
-            raise ValueError('type should be left, right or full')
+        return ret_val
     
     # svd decomposition
-    def get_orthogonal_matrix_cpu(self, matrix, rank):
+    def get_orthogonal_matrix_cpu(self, matrix, rank, type, float_data, original_device, original_type):
         #print(f"Doing SVD decomposition CPU. Matrix shape: {matrix.shape}")
         #start = time.time()
         # CPU SVD
@@ -140,5 +120,27 @@ class GaLoreProjector:
         #U, s, Vh = fbpca.pca(matrix.numpy(force=True).astype(np.float32), k=rank, n_iter=2)
         #U, s, Vh = torch.from_numpy(U), torch.from_numpy(s), torch.from_numpy(Vh)
         #print(f"SVD decomposition CPU done. Time taken: {time.time() - start:.2f} s")
-        return U, s, Vh
+        #make the smaller matrix always to be orthogonal matrix
+        if type=='right':
+            A = U[:, :rank] @ torch.diag(s[:rank])
+            B = Vh[:rank, :]
+            
+            if not float_data:
+                B = B.to(original_device).type(original_type)
+            return B
+        elif type=='left':
+            A = U[:, :rank]
+            B = torch.diag(s[:rank]) @ Vh[:rank, :]
+            if not float_data:
+                A = A.to(original_device).type(original_type)
+            return A
+        elif type=='full':
+            A = U[:, :rank]
+            B = Vh[:rank, :]
+            if not float_data:
+                A = A.to(original_device).type(original_type)
+                B = B.to(original_device).type(original_type)
+            return [A, B]
+        else:
+            raise ValueError('type should be left, right or full')
 
