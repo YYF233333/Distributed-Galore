@@ -13,6 +13,7 @@ from .multi_tensor_apply import MultiTensorApply
 multi_tensor_applier = MultiTensorApply(2048 * 32)
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.op_builder import FusedAdamBuilder
+from galore_projector import GaLoreProjector
 
 
 class FusedAdam(torch.optim.Optimizer):
@@ -143,8 +144,20 @@ class FusedAdam(torch.optim.Optimizer):
                 if p.grad.data.is_sparse:
                     raise RuntimeError(
                         'FusedAdam does not support sparse gradients, please consider SparseAdam instead')
-
+                # with GaLoreProjector
                 state = self.state[p]
+                if "rank" in group:
+                    if "projector" not in state:
+                        state["projector"] = GaLoreProjector(group["rank"], update_proj_gap=group["update_proj_gap"], scale=group["scale"], proj_type=group["proj_type"])
+                    
+                    if p.dtype == torch.float16:
+                        p.grad.data = state["projector"].project(p.grad.data, state["step"])
+                    elif p.dtype == torch.bfloat16:
+                        p.grad = state["projector"].project(p.grad, state["step"])
+                    elif p.dtype == torch.float32:
+                        p.grad.data = state["projector"].project(p.grad.data, state["step"])
+                    else:
+                        raise RuntimeError('FusedAdam only support fp16, bf16 and fp32.')
                 # State initialization
                 if len(state) == 0:
                     # DeepSpeed ZeRO 3 processes each subgroup a time, so we need to keep tracking step count for each tensor separately.
@@ -179,17 +192,27 @@ class FusedAdam(torch.optim.Optimizer):
                 multi_tensor_applier(self.multi_tensor_adam, self._dummy_overflow_buf, [g_16, p_16, m_16, v_16],
                                      group['lr'], beta1, beta2, group['eps'], state['step'], self.adam_w_mode,
                                      bias_correction, group['weight_decay'])
+                # GaLore Projection Back
+                if "rank" in group:
+                    p.grad.data = state["projector"].project_back(p.grad.data)
+                
 
             if len(g_bf) > 0:
                 state['step'] += 1
                 multi_tensor_applier(self.multi_tensor_adam, self._dummy_overflow_buf, [g_bf, p_bf, m_bf, v_bf],
                                      group['lr'], beta1, beta2, group['eps'], state['step'], self.adam_w_mode,
                                      bias_correction, group['weight_decay'])
+                # GaLore Projection Back
+                if "rank" in group:
+                    p.grad = state["projector"].project_back(p.grad)
 
             if len(g_32) > 0:
                 state['step'] += 1
                 multi_tensor_applier(self.multi_tensor_adam, self._dummy_overflow_buf, [g_32, p_32, m_32, v_32],
                                      group['lr'], beta1, beta2, group['eps'], state['step'], self.adam_w_mode,
                                      bias_correction, group['weight_decay'])
+                # GaLore Projection Back
+                if "rank" in group:
+                    p.grad.data = state["projector"].project_back(p.grad.data)
 
         return loss
